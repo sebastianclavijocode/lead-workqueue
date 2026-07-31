@@ -293,7 +293,7 @@ def asesor_view(user):
 def admin_view(user):
     session = get_session()
     st.title("🛠️ Panel de Administración")
-    tabs = st.tabs(["Dashboard", "Importar Leads", "Asignación", "Tipificaciones", "Usuarios"])
+    tabs = st.tabs(["Dashboard", "Importar Leads", "Asignación", "Tipificaciones", "Usuarios", "🧹 Mantenimiento"])
 
     # ---- Dashboard
     with tabs[0]:
@@ -454,6 +454,59 @@ def admin_view(user):
                 session.add(User(username=uname, name=name, password_hash=hash_pw(pw), role=role))
                 session.commit()
                 st.success("Usuario creado.")
+                st.rerun()
+
+    # ---- Mantenimiento
+    with tabs[5]:
+        st.subheader("🧹 Eliminar una campaña subida por error")
+        st.caption("Borra la campaña, sus leads y las gestiones asociadas. Úsalo cuando una "
+                   "importación quedó mal (columnas cruzadas, archivo equivocado, duplicados, etc.)")
+
+        campaigns = session.query(Campaign).all()
+        if campaigns:
+            camp_labels = {
+                f"{c.name} (#{c.id}) — {session.query(Lead).filter_by(campaign_id=c.id).count()} leads": c.id
+                for c in campaigns
+            }
+            sel_label = st.selectbox("Campaña a eliminar", list(camp_labels.keys()), key="del_camp_sel")
+            sel_id = camp_labels[sel_label]
+
+            confirm_text = st.text_input(
+                "Escribe ELIMINAR para confirmar (esta acción no se puede deshacer)",
+                key="confirm_delete_campaign",
+            )
+            if st.button("🗑️ Eliminar campaña seleccionada", type="primary"):
+                if confirm_text.strip().upper() != "ELIMINAR":
+                    st.error("Escribe exactamente ELIMINAR en el campo de confirmación.")
+                else:
+                    lead_ids = [l.id for l in session.query(Lead.id).filter_by(campaign_id=sel_id).all()]
+                    n_gestiones = session.query(Gestion).filter(Gestion.lead_id.in_(lead_ids)).delete(
+                        synchronize_session=False)
+                    n_leads = session.query(Lead).filter_by(campaign_id=sel_id).delete(synchronize_session=False)
+                    session.query(Campaign).filter_by(id=sel_id).delete(synchronize_session=False)
+                    session.commit()
+                    log(session, user.id, "DELETE_CAMPAIGN",
+                        detail=f"campaign_id={sel_id}, {n_leads} leads, {n_gestiones} gestiones")
+                    st.success(f"Campaña eliminada: {n_leads} leads y {n_gestiones} gestiones borrados.")
+                    st.rerun()
+        else:
+            st.caption("No hay campañas cargadas todavía.")
+
+        st.divider()
+        st.subheader("⚠️ Zona de peligro: vaciar toda la base de leads")
+        st.caption("Borra TODAS las campañas, leads y gestiones. Los usuarios y tipificaciones "
+                   "no se tocan. Úsalo solo si necesitas empezar de cero.")
+        confirm_all = st.text_input("Escribe BORRAR TODO para confirmar", key="confirm_wipe_all")
+        if st.button("🗑️ Vaciar toda la base de leads"):
+            if confirm_all.strip().upper() != "BORRAR TODO":
+                st.error("Escribe exactamente BORRAR TODO en el campo de confirmación.")
+            else:
+                n_g = session.query(Gestion).delete(synchronize_session=False)
+                n_l = session.query(Lead).delete(synchronize_session=False)
+                n_c = session.query(Campaign).delete(synchronize_session=False)
+                session.commit()
+                log(session, user.id, "WIPE_ALL_LEADS", detail=f"{n_l} leads, {n_c} campañas, {n_g} gestiones")
+                st.success(f"Base vaciada: {n_l} leads, {n_c} campañas, {n_g} gestiones eliminados.")
                 st.rerun()
 
     session.close()
