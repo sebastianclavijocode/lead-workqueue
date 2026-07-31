@@ -13,7 +13,27 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "workqueue.db")
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+
+
+def _get_database_url():
+    """Si hay una URL de base de datos externa configurada (Postgres en Neon/Supabase, etc.)
+    la usamos para que los datos sobrevivan a los reinicios de Streamlit Community Cloud,
+    que NO conserva archivos locales como el .db de SQLite entre despliegues/reinicios."""
+    try:
+        import streamlit as st
+        url = st.secrets.get("database", {}).get("url")
+        if url:
+            return url
+    except Exception:
+        pass
+    return os.environ.get("DATABASE_URL")
+
+
+_external_url = _get_database_url()
+if _external_url:
+    engine = create_engine(_external_url, pool_pre_ping=True)
+else:
+    engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 

@@ -75,6 +75,41 @@ from = "tu_correo@gmail.com"
 > producción se necesita un scheduler independiente (cron, APScheduler o una cola tipo BullMQ) —
 > ver sección de arquitectura de producción más abajo.
 
+### ⚠️ Persistencia de datos si publicas en Streamlit Community Cloud
+
+**Streamlit Community Cloud NO conserva archivos locales entre reinicios.** Cada vez que la app
+se "duerme" por inactividad, se redespliega, o el contenedor se recicla, el sistema de archivos
+vuelve a como está en tu repo de GitHub. Como `data/workqueue.db` no se sube a GitHub (está en
+`.gitignore` a propósito), **se pierde toda la información** — usuarios, leads, gestiones, todo.
+Esto no es un fallo del sistema, es una limitación conocida de ese hosting gratuito para apps con
+estado. Hacer copias de seguridad locales tampoco sirve, porque se perderían de la misma forma.
+
+**Solución: usar una base de datos externa persistente** (gratis, y ya soportado por el código):
+
+1. Crea una base de datos Postgres gratuita en [Neon](https://neon.tech) o
+   [Supabase](https://supabase.com) (ambos tienen plan free). Copia la cadena de conexión, algo
+   como `postgresql://usuario:password@host/basededatos?sslmode=require`.
+2. En Streamlit Community Cloud, entra a tu app → **⋮ → Settings → Secrets** y agrega:
+   ```toml
+   [database]
+   url = "postgresql://usuario:password@host/basededatos?sslmode=require"
+   ```
+3. Vuelve a desplegar. La app detecta automáticamente esta configuración (`db.py` la lee vía
+   `st.secrets`) y usa Postgres en vez de SQLite — los datos ya no se pierden entre reinicios.
+
+Si no configuras `[database]`, la app sigue funcionando con SQLite local (ideal para correrla en tu
+propia PC), pero **no es apta para producción en Streamlit Cloud** sin este paso.
+
+## Cambios recientes
+
+- **"Llamar después" ya no reaparece antes de tiempo**: el lead queda oculto de la cola activa del
+  asesor hasta que se cumple la fecha/hora programada; en ese momento vuelve a aparecer
+  automáticamente como cualquier otro pendiente.
+- **Detalle de citas agendadas en el Dashboard admin**: tabla con lead, teléfono, asesor y
+  fecha/hora de la cita — ya no solo el conteo.
+- **Base de datos externa opcional** (ver sección de arriba) para no perder datos en Streamlit
+  Community Cloud.
+
 ### Cambio de esquema — importante si ya tenías el prototipo corriendo
 
 Los campos "Empresa"/"Ciudad" fueron reemplazados por "Carrera"/"Años de experiencia"/"Dolor"/

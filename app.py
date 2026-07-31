@@ -7,6 +7,7 @@ from email.mime.text import MIMEText
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import or_
 
 from db import (
     init_db, get_session, hash_pw, NO_CONTESTA_LIMIT,
@@ -165,7 +166,9 @@ def asesor_view(user):
     just_opened = False
     if not lead:
         lead = (session.query(Lead)
-                .filter_by(assigned_to=user.id, status="pending")
+                .filter(Lead.assigned_to == user.id, Lead.status == "pending",
+                        or_(Lead.next_follow_up.is_(None),
+                            Lead.next_follow_up <= dt.datetime.utcnow()))
                 .order_by(Lead.sort_key.asc().nullslast(), Lead.created_at.asc())
                 .first())
         if lead:
@@ -248,6 +251,7 @@ def asesor_view(user):
                     lead.status = "done"
                 else:
                     lead.status = "pending"
+                    lead.next_follow_up = None
                     lead.sort_key = randomize_position(session, user.id, lead.id)
 
             elif chosen.name == "Llamar después" and extra_values.get("fecha"):
@@ -270,8 +274,11 @@ def asesor_view(user):
 
             elif not chosen.is_final:
                 lead.status = "pending"
+                lead.next_follow_up = None
+                lead.reminder_sent = False
             else:
                 lead.status = "done"
+                lead.next_follow_up = None
 
             gestion.closed_lead = (lead.status == "done")
             session.commit()
@@ -310,10 +317,22 @@ def admin_view(user):
             } for g in rows])
             st.markdown("**Productividad por asesor**")
             st.dataframe(df.groupby("Asesor").size().reset_index(name="Gestiones"), use_container_width=True)
-            st.markdown("**Citas agendadas por asesor**")
-            citas_df = df[df["Tipificación"] == "Cita agendada"]
-            if not citas_df.empty:
-                st.dataframe(citas_df.groupby("Asesor").size().reset_index(name="Citas"), use_container_width=True)
+            st.markdown("**Citas agendadas — detalle**")
+            citas_rows = (session.query(Gestion).join(Tipificacion)
+                          .filter(Tipificacion.name == "Cita agendada").all())
+            if citas_rows:
+                detail = []
+                for g in citas_rows:
+                    ed = json.loads(g.extra_data or "{}")
+                    detail.append({
+                        "Lead": g.lead.name,
+                        "Teléfono": g.lead.phone,
+                        "Asesor": g.user.name,
+                        "Fecha cita": ed.get("fecha", "—"),
+                        "Hora cita": ed.get("hora", "—"),
+                        "Registrado": g.created_at,
+                    })
+                st.dataframe(pd.DataFrame(detail).sort_values("Fecha cita"), use_container_width=True)
             else:
                 st.caption("Aún no hay citas agendadas.")
             st.markdown("**Leads por campaña**")
