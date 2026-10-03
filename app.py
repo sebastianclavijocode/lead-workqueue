@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import math
 import random
 import smtplib
 import ssl
@@ -432,20 +433,33 @@ def admin_view(user):
             query = session.query(Lead).filter(Lead.assigned_to == origin.id)
             if not include_done:
                 query = query.filter(Lead.status.in_(["pending", "in_progress"]))
-            count_to_move = query.count()
+            total_available = query.count()
 
-            st.caption(f"Leads que se moverían: **{count_to_move}**")
+            pct = st.radio("Porcentaje a mover", [25, 50, 75, 100], horizontal=True,
+                           index=3, key="bulk_pct")
+            count_to_move = math.ceil(total_available * pct / 100) if total_available else 0
+
+            st.caption(f"De {origin_name} tiene **{total_available}** leads disponibles → "
+                       f"se moverían **{count_to_move}** ({pct}%), elegidos al azar.")
             confirm_bulk = st.text_input("Escribe MOVER para confirmar", key="confirm_bulk_reassign")
-            if st.button(f"🔁 Mover {count_to_move} leads de {origin_name} a {dest_name}", type="primary"):
+            if st.button(f"🔁 Mover {count_to_move} leads ({pct}%) de {origin_name} a {dest_name}",
+                        type="primary"):
                 if confirm_bulk.strip().upper() != "MOVER":
                     st.error("Escribe exactamente MOVER en el campo de confirmación.")
                 elif count_to_move == 0:
                     st.warning("No hay leads que mover con esos filtros.")
                 else:
-                    n = query.update({Lead.assigned_to: dest.id}, synchronize_session=False)
+                    if pct == 100:
+                        target_ids = [l.id for l in query.all()]
+                    else:
+                        all_ids = [l.id for l in query.all()]
+                        target_ids = random.sample(all_ids, count_to_move)
+                    n = (session.query(Lead).filter(Lead.id.in_(target_ids))
+                         .update({Lead.assigned_to: dest.id}, synchronize_session=False))
                     session.commit()
                     log(session, user.id, "REASSIGN_BULK",
-                        detail=f"{n} leads: {origin_name} -> {dest_name} (incluye cerrados: {include_done})")
+                        detail=f"{n} leads ({pct}%): {origin_name} -> {dest_name} "
+                               f"(incluye cerrados: {include_done})")
                     st.success(f"{n} leads movidos de {origin_name} a {dest_name}.")
                     st.rerun()
         else:
