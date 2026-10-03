@@ -415,6 +415,42 @@ def admin_view(user):
         else:
             st.caption("No hay asesores activos o no hay leads pendientes por asignar.")
 
+        st.divider()
+        st.subheader("🔁 Reasignación masiva entre asesores")
+        st.caption("Mueve de un asesor a otro aunque los leads ya estén asignados.")
+        advisors_all = session.query(User).filter_by(role="asesor", active=True).all()
+        if len(advisors_all) >= 2:
+            colA, colB = st.columns(2)
+            origin_name = colA.selectbox("Desde (asesor origen)", [a.name for a in advisors_all],
+                                          key="bulk_origin")
+            dest_options = [a.name for a in advisors_all if a.name != origin_name]
+            dest_name = colB.selectbox("Hacia (asesor destino)", dest_options, key="bulk_dest")
+            include_done = st.checkbox("Incluir también los leads ya gestionados (cerrados)", value=False)
+
+            origin = next(a for a in advisors_all if a.name == origin_name)
+            dest = next(a for a in advisors_all if a.name == dest_name)
+            query = session.query(Lead).filter(Lead.assigned_to == origin.id)
+            if not include_done:
+                query = query.filter(Lead.status.in_(["pending", "in_progress"]))
+            count_to_move = query.count()
+
+            st.caption(f"Leads que se moverían: **{count_to_move}**")
+            confirm_bulk = st.text_input("Escribe MOVER para confirmar", key="confirm_bulk_reassign")
+            if st.button(f"🔁 Mover {count_to_move} leads de {origin_name} a {dest_name}", type="primary"):
+                if confirm_bulk.strip().upper() != "MOVER":
+                    st.error("Escribe exactamente MOVER en el campo de confirmación.")
+                elif count_to_move == 0:
+                    st.warning("No hay leads que mover con esos filtros.")
+                else:
+                    n = query.update({Lead.assigned_to: dest.id}, synchronize_session=False)
+                    session.commit()
+                    log(session, user.id, "REASSIGN_BULK",
+                        detail=f"{n} leads: {origin_name} -> {dest_name} (incluye cerrados: {include_done})")
+                    st.success(f"{n} leads movidos de {origin_name} a {dest_name}.")
+                    st.rerun()
+        else:
+            st.caption("Necesitas al menos 2 asesores activos para reasignar en bloque.")
+
     # ---- Tipificaciones
     with tabs[3]:
         st.subheader("Tipificaciones existentes")
