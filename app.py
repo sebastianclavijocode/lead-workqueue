@@ -177,7 +177,10 @@ def asesor_view(user):
 
     flash = st.session_state.pop("flash", None)
     if flash:
-        st.warning(flash) if flash.startswith("⚠️") else st.success(flash)
+        if flash.startswith("⚠️"):
+            st.warning(flash)
+        else:
+            st.success(flash)
 
     if user.email:
         _, reminder_errors = send_due_reminders(session, user)
@@ -199,7 +202,10 @@ def asesor_view(user):
             else:
                 ok, msg = send_email(target, "Prueba de recordatorios — Work Queue",
                                      "Si recibes este correo, los recordatorios de seguimiento funcionan.")
-                st.success(f"✅ {msg}") if ok else st.error(f"❌ No se pudo enviar: {msg}")
+                if ok:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"❌ No se pudo enviar: {msg}")
 
     pending_count = session.query(Lead).filter_by(assigned_to=user.id, status="pending").count()
     in_progress_count = session.query(Lead).filter_by(assigned_to=user.id, status="in_progress").count()
@@ -612,14 +618,33 @@ def admin_view(user):
             "Usuario": u.username, "Nombre": u.name, "Rol": u.role,
             "Correo": u.email or "—", "Activo": u.active,
         } for u in users]), use_container_width=True)
+        st.markdown("**Correo de recordatorios por asesor**")
+        st.caption("Cada asesor recibe los recordatorios de 'Llamar después' en su propio correo "
+                   "(él mismo también puede cambiarlo desde su pantalla).")
+        user_labels = {f"{u.name} ({u.username})": u.id for u in users}
+        sel_user_label = st.selectbox("Usuario", list(user_labels.keys()), key="email_user_sel")
+        sel_user_id = user_labels[sel_user_label]
+        sel_user = next(u for u in users if u.id == sel_user_id)
+        # La key incluye el id para que el campo se rellene con el correo del usuario elegido
+        new_email = st.text_input("Correo", value=sel_user.email or "", key=f"admin_email_{sel_user_id}")
+        if st.button("Guardar correo del usuario", key="admin_save_user_email"):
+            sel_user.email = new_email.strip() or None
+            session.commit()
+            log(session, user.id, "UPDATE_EMAIL", detail=f"{sel_user.username}")
+            st.success(f"Correo de {sel_user.name} actualizado.")
+            st.rerun()
+
+        st.divider()
         with st.form("new_user"):
             st.caption("Nuevo usuario")
             uname = st.text_input("Usuario")
             name = st.text_input("Nombre completo")
+            email_new = st.text_input("Correo (para recordatorios)")
             pw = st.text_input("Contraseña", type="password")
             role = st.selectbox("Rol", ["asesor", "supervisor", "admin"])
             if st.form_submit_button("Crear usuario"):
-                session.add(User(username=uname, name=name, password_hash=hash_pw(pw), role=role))
+                session.add(User(username=uname, name=name, password_hash=hash_pw(pw), role=role,
+                                 email=email_new.strip() or None))
                 session.commit()
                 st.success("Usuario creado.")
                 st.rerun()
@@ -640,7 +665,10 @@ def admin_view(user):
             else:
                 ok, msg = send_email(test_to.strip(), "Prueba de correo — Work Queue",
                                      "Si recibes este mensaje, el envío de correos está bien configurado.")
-                st.success(f"✅ {msg}") if ok else st.error(f"❌ No se pudo enviar: {msg}")
+                if ok:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"❌ No se pudo enviar: {msg}")
         if st.button("🔔 Revisar y enviar recordatorios vencidos ahora", key="admin_send_due"):
             total_sent, all_errors, sin_correo = 0, [], []
             for adv in session.query(User).filter_by(role="asesor", active=True).all():
