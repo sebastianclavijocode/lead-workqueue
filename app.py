@@ -57,34 +57,75 @@ def get_smtp_config():
     return None
 
 
+def _smtp_attempt(host, port, use_ssl, user, password, sender, to_email, msg_str):
+    """Un intento de envío. Devuelve (ok, error, es_fallo_de_conexion). El error indica en qué
+    paso se cayó (conexión, STARTTLS, login o envío) para poder diagnosticarlo."""
+    modo = "SSL" if use_ssl else "STARTTLS"
+    step = "conectar / esperar el saludo del servidor"
+    ctx = ssl.create_default_context()
+    try:
+        server = (smtplib.SMTP_SSL(host, port, timeout=20, context=ctx) if use_ssl
+                  else smtplib.SMTP(host, port, timeout=20))
+        with server:
+            if not use_ssl:
+                step = "STARTTLS"
+                server.ehlo()
+                server.starttls(context=ctx)
+                server.ehlo()
+            step = "login"
+            server.login(user, password)
+            step = "enviar el mensaje"
+            server.sendmail(sender, [to_email], msg_str)
+        return True, "", False
+    except Exception as e:
+        # Solo se reintenta en otro puerto si la conexión se cae ANTES de autenticarse.
+        # Un fallo de login/destinatario no se arregla cambiando de puerto (y repetir logins
+        # fallidos puede hacer que Google bloquee temporalmente la cuenta).
+        connection_level = (step in ("conectar / esperar el saludo del servidor", "STARTTLS")
+                            and isinstance(e, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError,
+                                               ConnectionError, TimeoutError, ssl.SSLError, OSError)))
+        return False, f"[{host}:{port} {modo} · paso: {step}] {type(e).__name__}: {e}", connection_level
+
+
 def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
-    """Envía un correo por SMTP. Devuelve (ok, mensaje); el mensaje trae el error real si falla."""
+    """Envía un correo por SMTP. Devuelve (ok, mensaje); el mensaje trae el error real si falla.
+    Si la conexión se cae en el puerto configurado, prueba también el alterno (587 <-> 465)."""
     cfg = get_smtp_config()
     if not cfg:
         faltan = [k for k, ok in smtp_status().items() if not ok]
         return False, ("SMTP no configurado: faltan en Secrets los campos "
                        f"{', '.join(faltan) or 'host/user/password'} dentro de [smtp].")
+    host = str(cfg["host"]).strip()
+    user = str(cfg["user"]).strip()
+    password = str(cfg["password"]).replace(" ", "")  # las claves de app de Gmail vienen con espacios
+    sender = str(cfg.get("from") or user).strip()
     try:
-        sender = cfg.get("from") or cfg["user"]
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = to_email
-        port = int(cfg.get("port", 587))
-        password = str(cfg["password"]).replace(" ", "")  # las claves de app de Gmail vienen con espacios
-        if port == 465:
-            with smtplib.SMTP_SSL(cfg["host"], port, timeout=20,
-                                  context=ssl.create_default_context()) as server:
-                server.login(cfg["user"], password)
-                server.sendmail(sender, [to_email], msg.as_string())
-        else:
-            with smtplib.SMTP(cfg["host"], port, timeout=20) as server:
-                server.starttls(context=ssl.create_default_context())
-                server.login(cfg["user"], password)
-                server.sendmail(sender, [to_email], msg.as_string())
-        return True, f"Enviado a {to_email}."
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        port = int(str(cfg.get("port", 587)).strip())
+    except ValueError:
+        return False, f"El puerto en Secrets no es un número válido: {cfg.get('port')!r}."
+    if "://" in host or ":" in host or "@" in host:
+        return False, (f"El host en Secrets parece incorrecto ({host!r}). Debe ser solo el nombre del "
+                       "servidor, por ejemplo smtp.gmail.com (sin puerto ni https://).")
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to_email
+    msg_str = msg.as_string()
+
+    attempts = [(port, port == 465)]
+    if port in (587, 465):
+        attempts.append((465, True) if port == 587 else (587, False))
+
+    errors = []
+    for i, (prt, use_ssl) in enumerate(attempts):
+        ok, err, connection_level = _smtp_attempt(host, prt, use_ssl, user, password, sender, to_email, msg_str)
+        if ok:
+            return True, f"Enviado a {to_email} (puerto {prt})."
+        errors.append(err)
+        if not connection_level:
+            break  # error de login/destinatario: probar otro puerto no ayuda
+    return False, " || ".join(errors)
 
 
 def send_due_reminders(session, user):
