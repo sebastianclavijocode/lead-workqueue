@@ -9,9 +9,11 @@ from email.mime.text import MIMEText
 import pandas as pd
 import streamlit as st
 from sqlalchemy import or_
+from sqlalchemy.orm import joinedload
 
 from db import (
-    init_db, get_session, hash_pw, NO_CONTESTA_LIMIT,
+    init_db, get_session, hash_pw, NO_CONTESTA_LIMIT, NO_CONTESTA_GAP,
+    now_local, to_local, local_day_start_utc,
     User, Campaign, Lead, Tipificacion, Gestion, AuditLog,
 )
 
@@ -35,8 +37,17 @@ def log(session, user_id, action, lead_id=None, detail=None):
 
 
 # ---------------------------------------------------------------- EMAIL (recordatorios "Llamar después")
+def smtp_status() -> dict:
+    """Indica qué parte de la configuración SMTP está presente en los secrets (sin exponer la contraseña)."""
+    try:
+        cfg = st.secrets.get("smtp") or {}
+    except Exception:
+        cfg = {}
+    return {k: bool(cfg.get(k)) for k in ("host", "user", "password")}
+
+
 def get_smtp_config():
-    """Lee la configuración SMTP desde .streamlit/secrets.toml. Devuelve None si no está configurada."""
+    """Lee la configuración SMTP desde los secrets ([smtp]). Devuelve None si está incompleta."""
     try:
         cfg = st.secrets.get("smtp")
         if cfg and cfg.get("host") and cfg.get("user") and cfg.get("password"):
@@ -47,38 +58,49 @@ def get_smtp_config():
 
 
 def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    """Envía un correo por SMTP. Devuelve (ok, mensaje); el mensaje trae el error real si falla."""
     cfg = get_smtp_config()
     if not cfg:
-        return False, "SMTP no configurado (.streamlit/secrets.toml)."
+        faltan = [k for k, ok in smtp_status().items() if not ok]
+        return False, ("SMTP no configurado: faltan en Secrets los campos "
+                       f"{', '.join(faltan) or 'host/user/password'} dentro de [smtp].")
     try:
+        sender = cfg.get("from") or cfg["user"]
         msg = MIMEText(body)
         msg["Subject"] = subject
-        msg["From"] = cfg.get("from", cfg["user"])
+        msg["From"] = sender
         msg["To"] = to_email
-        context = ssl.create_default_context()
-        with smtplib.SMTP(cfg["host"], int(cfg.get("port", 587))) as server:
-            server.starttls(context=context)
-            server.login(cfg["user"], cfg["password"])
-            server.sendmail(msg["From"], [to_email], msg.as_string())
-        return True, "Enviado."
+        port = int(cfg.get("port", 587))
+        password = str(cfg["password"]).replace(" ", "")  # las claves de app de Gmail vienen con espacios
+        if port == 465:
+            with smtplib.SMTP_SSL(cfg["host"], port, timeout=20,
+                                  context=ssl.create_default_context()) as server:
+                server.login(cfg["user"], password)
+                server.sendmail(sender, [to_email], msg.as_string())
+        else:
+            with smtplib.SMTP(cfg["host"], port, timeout=20) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(cfg["user"], password)
+                server.sendmail(sender, [to_email], msg.as_string())
+        return True, f"Enviado a {to_email}."
     except Exception as e:
-        return False, str(e)
+        return False, f"{type(e).__name__}: {e}"
 
 
 def send_due_reminders(session, user):
-    """Revisa, cada vez que el asesor abre la app, si hay seguimientos ('Llamar después')
-    cuya fecha/hora ya se cumplió y envía el correo pendiente. Es una verificación 'al vuelo',
-    no un scheduler real: solo dispara mientras la app está abierta. Para producción se
-    recomienda un job (cron/APScheduler) que corra de forma independiente."""
+    """Envía los recordatorios de 'Llamar después' cuya fecha/hora (hora local) ya se cumplió.
+    Se ejecuta cada vez que el asesor abre/recarga la app (no es un scheduler en segundo plano).
+    Devuelve (enviados, errores) para poder mostrarlo en pruebas manuales."""
     if not user.email:
-        return
+        return 0, ["El asesor no tiene correo guardado."]
     due = (session.query(Lead)
            .filter(Lead.assigned_to == user.id, Lead.reminder_sent == False,  # noqa: E712
                    Lead.next_follow_up.isnot(None),
-                   Lead.next_follow_up <= dt.datetime.utcnow())
+                   Lead.next_follow_up <= now_local())
            .all())
+    sent, errors = 0, []
     for lead in due:
-        ok, _ = send_email(
+        ok, msg = send_email(
             user.email,
             f"Recordatorio de seguimiento — {lead.name or 'Lead #' + str(lead.id)}",
             f"Es hora de contactar de nuevo a {lead.name} ({lead.phone}).\n"
@@ -86,26 +108,44 @@ def send_due_reminders(session, user):
             f"Carrera: {lead.carrera or '-'} | Dolor: {lead.dolor or '-'}",
         )
         lead.reminder_sent = ok  # si falla el envío, se reintenta en el siguiente check
+        if ok:
+            sent += 1
+        else:
+            errors.append(msg)
     if due:
         session.commit()
+    return sent, errors
 
 
-def randomize_position(session, user_id, exclude_lead_id):
-    """Calcula un sort_key que inserta el lead en una posición aleatoria dentro
-    de la cola de pendientes del asesor (usado para 'No contesta')."""
-    others = (session.query(Lead.sort_key)
-              .filter(Lead.assigned_to == user_id, Lead.status == "pending",
-                      Lead.id != exclude_lead_id)
-              .order_by(Lead.sort_key.asc()).all())
-    keys = [o[0] if o[0] is not None else 0.0 for o in others]
+def _eligible_other_keys(session, user_id, exclude_lead_id):
+    """sort_key (ordenados) de los demás leads que el asesor podría ver ahora mismo en su cola."""
+    rows = (session.query(Lead.sort_key)
+            .filter(Lead.assigned_to == user_id, Lead.status == "pending",
+                    Lead.id != exclude_lead_id,
+                    or_(Lead.next_follow_up.is_(None), Lead.next_follow_up <= now_local()))
+            .order_by(Lead.sort_key.asc()).all())
+    return [r[0] if r[0] is not None else 0.0 for r in rows]
+
+
+def position_after_n(session, user_id, exclude_lead_id, n):
+    """sort_key para que el lead reaparezca después de n leads más de la cola del asesor
+    (usado para 'No contesta': vuelve cada NO_CONTESTA_GAP leads). Si la cola tiene menos de
+    n leads, queda al final."""
+    keys = _eligible_other_keys(session, user_id, exclude_lead_id)
     if not keys:
         return dt.datetime.utcnow().timestamp()
-    idx = random.randint(0, len(keys))
-    if idx == 0:
-        return keys[0] - random.uniform(0.5, 2.0)
-    if idx == len(keys):
-        return keys[-1] + random.uniform(0.5, 2.0)
-    return (keys[idx - 1] + keys[idx]) / 2
+    if len(keys) <= n:
+        return keys[-1] + 1.0
+    return (keys[n - 1] + keys[n]) / 2
+
+
+def front_sort_key(session, user_id, exclude_lead_id):
+    """sort_key que pone el lead de primero en la cola (para seguimientos 'Llamar después' ya vencidos)."""
+    rows = (session.query(Lead.sort_key)
+            .filter(Lead.assigned_to == user_id, Lead.id != exclude_lead_id)
+            .order_by(Lead.sort_key.asc()).first())
+    first = rows[0] if rows and rows[0] is not None else 0.0
+    return first - 1.0
 
 
 # ---------------------------------------------------------------- LOGIN
@@ -135,21 +175,38 @@ def asesor_view(user):
     session = get_session()
     st.title(f"👋 Hola, {user.name}")
 
-    send_due_reminders(session, user)
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.warning(flash) if flash.startswith("⚠️") else st.success(flash)
+
+    if user.email:
+        _, reminder_errors = send_due_reminders(session, user)
+        if reminder_errors:
+            st.warning("⚠️ Hay un recordatorio vencido que no se pudo enviar por correo: "
+                       f"{reminder_errors[0]}")
 
     with st.expander("✉️ Mi correo para recordatorios de seguimiento"):
         email_input = st.text_input("Correo", value=user.email or "", key="email_input")
-        if st.button("Guardar correo"):
+        col_save, col_test = st.columns(2)
+        if col_save.button("Guardar correo"):
             user.email = email_input.strip()
             session.commit()
             st.success("Correo actualizado.")
+        if col_test.button("📨 Enviar correo de prueba"):
+            target = (email_input or user.email or "").strip()
+            if not target:
+                st.error("Escribe y guarda tu correo primero.")
+            else:
+                ok, msg = send_email(target, "Prueba de recordatorios — Work Queue",
+                                     "Si recibes este correo, los recordatorios de seguimiento funcionan.")
+                st.success(f"✅ {msg}") if ok else st.error(f"❌ No se pudo enviar: {msg}")
 
     pending_count = session.query(Lead).filter_by(assigned_to=user.id, status="pending").count()
     in_progress_count = session.query(Lead).filter_by(assigned_to=user.id, status="in_progress").count()
     done_today = session.query(Gestion).filter(
         Gestion.user_id == user.id,
         Gestion.closed_lead == True,  # noqa: E712 — solo cierres reales, no intentos como "No contesta"
-        Gestion.created_at >= dt.datetime.combine(dt.date.today(), dt.time.min),
+        Gestion.created_at >= local_day_start_utc(now_local().date()),
     ).count()
     c1, c2 = st.columns(2)
     c1.markdown(f'<div class="metric-card"><h3>Pendientes</h3><h1>{pending_count + in_progress_count}</h1></div>',
@@ -169,7 +226,7 @@ def asesor_view(user):
         lead = (session.query(Lead)
                 .filter(Lead.assigned_to == user.id, Lead.status == "pending",
                         or_(Lead.next_follow_up.is_(None),
-                            Lead.next_follow_up <= dt.datetime.utcnow()))
+                            Lead.next_follow_up <= now_local()))
                 .order_by(Lead.sort_key.asc().nullslast(), Lead.created_at.asc())
                 .first())
         if lead:
@@ -253,7 +310,7 @@ def asesor_view(user):
                 else:
                     lead.status = "pending"
                     lead.next_follow_up = None
-                    lead.sort_key = randomize_position(session, user.id, lead.id)
+                    lead.sort_key = position_after_n(session, user.id, lead.id, NO_CONTESTA_GAP)
 
             elif chosen.name == "Llamar después" and extra_values.get("fecha"):
                 lead.status = "pending"
@@ -264,14 +321,20 @@ def asesor_view(user):
                 except ValueError:
                     lead.next_follow_up = dt.datetime.fromisoformat(fecha)
                 lead.reminder_sent = False
-                lead.sort_key = randomize_position(session, user.id, lead.id)
+                # Al vencer la fecha, el lead debe ser el siguiente en aparecer (no perderse en la cola)
+                lead.sort_key = front_sort_key(session, user.id, lead.id)
                 if user.email:
-                    send_email(
+                    ok_mail, msg_mail = send_email(
                         user.email,
                         f"Seguimiento programado — {lead.name or 'Lead #' + str(lead.id)}",
                         f"Se programó un recordatorio para contactar a {lead.name} ({lead.phone}) "
                         f"el {lead.next_follow_up:%Y-%m-%d %H:%M}.",
                     )
+                    if not ok_mail:
+                        st.session_state["flash"] = f"⚠️ Seguimiento guardado, pero el correo no se envió: {msg_mail}"
+                else:
+                    st.session_state["flash"] = ("⚠️ Seguimiento guardado, pero no tienes correo registrado "
+                                                 "para recibir el recordatorio.")
 
             elif not chosen.is_final:
                 lead.status = "pending"
@@ -298,53 +361,108 @@ def admin_view(user):
 
     # ---- Dashboard
     with tabs[0]:
+        today = now_local().date()
+        period = st.radio("Período", ["Hoy", "Ayer", "Últimos 7 días", "Últimos 30 días", "Personalizado", "Todo"],
+                          horizontal=True, key="dash_period")
+        if period == "Hoy":
+            d_from = d_to = today
+        elif period == "Ayer":
+            d_from = d_to = today - dt.timedelta(days=1)
+        elif period == "Últimos 7 días":
+            d_from, d_to = today - dt.timedelta(days=6), today
+        elif period == "Últimos 30 días":
+            d_from, d_to = today - dt.timedelta(days=29), today
+        elif period == "Personalizado":
+            rng = st.date_input("Rango de fechas", value=(today - dt.timedelta(days=6), today),
+                                key="dash_range")
+            if isinstance(rng, (tuple, list)):
+                d_from = rng[0] if rng else today
+                d_to = rng[1] if len(rng) > 1 else d_from
+            else:
+                d_from = d_to = rng
+        else:
+            d_from = d_to = None
+
+        gq = session.query(Gestion).options(
+            joinedload(Gestion.lead), joinedload(Gestion.user), joinedload(Gestion.tipificacion))
+        if d_from:
+            gq = gq.filter(Gestion.created_at >= local_day_start_utc(d_from),
+                           Gestion.created_at < local_day_start_utc(d_to + dt.timedelta(days=1)))
+            st.caption(f"Mostrando gestiones del {d_from:%d/%m/%Y} al {d_to:%d/%m/%Y} (hora Colombia).")
+        gestiones = gq.all()
+
         total = session.query(Lead).count()
         pend = session.query(Lead).filter(Lead.status.in_(["pending", "in_progress"])).count()
-        done = session.query(Lead).filter_by(status="done").count()
-        ventas = session.query(Gestion).join(Tipificacion).filter(Tipificacion.name == "Venta").count()
-        citas = session.query(Gestion).join(Tipificacion).filter(Tipificacion.name == "Cita agendada").count()
+        cerrados = sum(1 for g in gestiones if g.closed_lead)
+        ventas = sum(1 for g in gestiones if g.tipificacion.name == "Venta")
+        citas = sum(1 for g in gestiones if g.tipificacion.name == "Cita agendada")
         c1, c2, c3, c4, c5 = st.columns(5)
         for c, label, val in zip([c1, c2, c3, c4, c5],
-                                  ["Cargados", "Pendientes", "Gestionados", "Ventas", "Citas agendadas"],
-                                  [total, pend, done, ventas, citas]):
+                                  ["Cargados (total)", "Pendientes (ahora)", "Gestionados", "Ventas", "Citas agendadas"],
+                                  [total, pend, cerrados, ventas, citas]):
             c.markdown(f'<div class="metric-card"><h4>{label}</h4><h2>{val}</h2></div>', unsafe_allow_html=True)
+        st.caption("Cargados y Pendientes son el estado actual; Gestionados, Ventas y Citas corresponden al período elegido.")
 
         st.divider()
-        rows = session.query(Gestion).all()
-        if rows:
+        if gestiones:
             df = pd.DataFrame([{
-                "Asesor": g.user.name, "Tipificación": g.tipificacion.name,
-                "Fecha": g.created_at,
-            } for g in rows])
+                "Asesor": g.user.name, "Tipificación": g.tipificacion.name, "Cerró lead": bool(g.closed_lead),
+            } for g in gestiones])
             st.markdown("**Productividad por asesor**")
-            st.dataframe(df.groupby("Asesor").size().reset_index(name="Gestiones"), use_container_width=True)
+            prod = df.groupby("Asesor").agg(
+                Gestiones=("Tipificación", "size"),
+                Gestionados=("Cerró lead", "sum"),
+                Ventas=("Tipificación", lambda x: int((x == "Venta").sum())),
+                Citas=("Tipificación", lambda x: int((x == "Cita agendada").sum())),
+            ).reset_index()
+            st.dataframe(prod, use_container_width=True)
+
+            st.markdown("**Resultados por tipificación**")
+            st.dataframe(df["Tipificación"].value_counts().rename_axis("Tipificación")
+                         .reset_index(name="Cantidad"), use_container_width=True)
+
             st.markdown("**Citas agendadas — detalle**")
-            citas_rows = (session.query(Gestion).join(Tipificacion)
-                          .filter(Tipificacion.name == "Cita agendada").all())
-            if citas_rows:
-                detail = []
-                for g in citas_rows:
-                    ed = json.loads(g.extra_data or "{}")
-                    detail.append({
-                        "Lead": g.lead.name,
-                        "Teléfono": g.lead.phone,
-                        "Asesor": g.user.name,
-                        "Fecha cita": ed.get("fecha", "—"),
-                        "Hora cita": ed.get("hora", "—"),
-                        "Registrado": g.created_at,
-                    })
+            detail = []
+            for g in gestiones:
+                if g.tipificacion.name != "Cita agendada":
+                    continue
+                ed = json.loads(g.extra_data or "{}")
+                detail.append({
+                    "Lead": g.lead.name, "Teléfono": g.lead.phone, "Asesor": g.user.name,
+                    "Fecha cita": ed.get("fecha", "—"), "Hora cita": ed.get("hora", "—"),
+                    "Registrado": to_local(g.created_at).strftime("%Y-%m-%d %H:%M"),
+                })
+            if detail:
                 st.dataframe(pd.DataFrame(detail).sort_values("Fecha cita"), use_container_width=True)
             else:
-                st.caption("Aún no hay citas agendadas.")
-            st.markdown("**Leads por campaña**")
-            camp_rows = [{"Campaña": l.campaign.name if l.campaign else "—", "Estado": l.status}
-                         for l in session.query(Lead).all()]
-            if camp_rows:
-                cdf = pd.DataFrame(camp_rows)
-                st.dataframe(cdf.groupby(["Campaña", "Estado"]).size().reset_index(name="Leads"),
-                             use_container_width=True)
+                st.caption("No hay citas agendadas en este período.")
+
+            st.markdown("**Detalle de gestiones del período**")
+            only_closed = st.checkbox("Solo los que cerraron el lead (gestionados)", value=True, key="dash_only_closed")
+            rows = [{
+                "Fecha": to_local(g.created_at).strftime("%Y-%m-%d %H:%M"),
+                "Lead": g.lead.name, "Teléfono": g.lead.phone, "Asesor": g.user.name,
+                "Tipificación": g.tipificacion.name, "Cerró lead": "Sí" if g.closed_lead else "No",
+                "Notas": g.notes or "",
+            } for g in sorted(gestiones, key=lambda x: x.created_at, reverse=True)
+                if g.closed_lead or not only_closed]
+            if rows:
+                ddf = pd.DataFrame(rows)
+                st.dataframe(ddf, use_container_width=True)
+                st.download_button("⬇️ Descargar detalle (CSV)", ddf.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"gestiones_{period.lower().replace(' ', '_')}.csv", mime="text/csv")
+            else:
+                st.caption("No hay gestiones que cumplan ese filtro.")
         else:
-            st.caption("Aún no hay gestiones registradas.")
+            st.caption("No hay gestiones registradas en este período.")
+
+        st.markdown("**Leads por campaña**")
+        camp_rows = [{"Campaña": l.campaign.name if l.campaign else "—", "Estado": l.status}
+                     for l in session.query(Lead).options(joinedload(Lead.campaign)).all()]
+        if camp_rows:
+            cdf = pd.DataFrame(camp_rows)
+            st.dataframe(cdf.groupby(["Campaña", "Estado"]).size().reset_index(name="Leads"),
+                         use_container_width=True)
 
     # ---- Importar
     with tabs[1]:
@@ -508,6 +626,37 @@ def admin_view(user):
 
     # ---- Mantenimiento
     with tabs[5]:
+        st.subheader("✉️ Diagnóstico de correo")
+        status = smtp_status()
+        st.caption("Configuración SMTP detectada en Secrets: "
+                   + " · ".join(f"{'✅' if ok else '❌'} {k}" for k, ok in status.items()))
+        if not all(status.values()):
+            st.warning("Falta configuración: en Streamlit Cloud → ⋮ → Settings → Secrets agrega el bloque "
+                       "[smtp] con host, port, user y password (ver README).")
+        test_to = st.text_input("Enviar correo de prueba a", value=user.email or "", key="admin_test_mail")
+        if st.button("📨 Enviar correo de prueba", key="admin_send_test"):
+            if not test_to.strip():
+                st.error("Escribe un correo de destino.")
+            else:
+                ok, msg = send_email(test_to.strip(), "Prueba de correo — Work Queue",
+                                     "Si recibes este mensaje, el envío de correos está bien configurado.")
+                st.success(f"✅ {msg}") if ok else st.error(f"❌ No se pudo enviar: {msg}")
+        if st.button("🔔 Revisar y enviar recordatorios vencidos ahora", key="admin_send_due"):
+            total_sent, all_errors, sin_correo = 0, [], []
+            for adv in session.query(User).filter_by(role="asesor", active=True).all():
+                if not adv.email:
+                    sin_correo.append(adv.name)
+                    continue
+                n_sent, errs = send_due_reminders(session, adv)
+                total_sent += n_sent
+                all_errors += [f"{adv.name}: {e}" for e in errs]
+            st.success(f"Recordatorios enviados: {total_sent}.")
+            if all_errors:
+                st.error("Errores: " + " | ".join(all_errors))
+            if sin_correo:
+                st.info("Asesores sin correo guardado (no se les envía): " + ", ".join(sin_correo))
+
+        st.divider()
         st.subheader("🧹 Eliminar una campaña subida por error")
         st.caption("Borra la campaña, sus leads y las gestiones asociadas. Úsalo cuando una "
                    "importación quedó mal (columnas cruzadas, archivo equivocado, duplicados, etc.)")

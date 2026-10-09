@@ -36,9 +36,9 @@ Usuarios demo (creados automáticamente en el primer arranque):
   tipificación u otro campo sin presionar "Guardar y siguiente" ya NO salta al próximo lead —
   antes era un bug porque la cola solo miraba leads "pending" y al abrir uno se marcaba
   "in_progress", desapareciendo de esa consulta en el siguiente rerender.
-- **"No contesta"**: el lead vuelve a la cola en una **posición aleatoria** (no al final ni de
-  inmediato) para reintentar más tarde. Al tercer "No contesta" se cierra automáticamente como
-  gestionado.
+- **"No contesta"**: el lead vuelve a la cola y reaparece **después de gestionar 30 leads más**
+  (constante `NO_CONTESTA_GAP` en `db.py`; si la cola tiene menos de 30, queda al final). Al tercer
+  "No contesta" se cierra automáticamente como gestionado.
 - **"Llamar después"**: abre selector de fecha y hora (calendario/reloj nativos), el lead queda en
   `pending` para la fecha programada, y si el asesor configuró su correo se envía una notificación
   de confirmación + un recordatorio automático cuando la fecha/hora se cumple (ver sección de
@@ -55,20 +55,28 @@ Usuarios demo (creados automáticamente en el primer arranque):
 - Permisos validados en la capa de datos/consultas, no solo ocultando botones en la UI: un asesor
   solo puede ver/gestionar leads donde `assigned_to == user.id`.
 
-### Configurar el envío real de correos (opcional)
+### Configurar el envío real de correos
 
-Sin configuración, los recordatorios de "Llamar después" simplemente no se envían (el lead sigue
-funcionando normalmente, solo no llega el email). Para activarlo, crea el archivo
-`.streamlit/secrets.toml` dentro de la carpeta del proyecto:
+Los recordatorios de "Llamar después" necesitan una cuenta SMTP. Con Gmail:
+
+1. Activa la verificación en 2 pasos en la cuenta de Google que enviará los correos.
+2. Crea una **contraseña de aplicación** en https://myaccount.google.com/apppasswords
+   (16 caracteres; se puede pegar con o sin espacios).
+3. En Streamlit Cloud → tu app → ⋮ → Settings → **Secrets** agrega (en local, el mismo contenido
+   va en `.streamlit/secrets.toml`):
 
 ```toml
 [smtp]
 host = "smtp.gmail.com"
 port = 587
 user = "tu_correo@gmail.com"
-password = "tu_contraseña_de_aplicación"
+password = "tu contraseña de aplicación"
 from = "tu_correo@gmail.com"
 ```
+
+4. Entra como admin → pestaña **🧹 Mantenimiento → ✉️ Diagnóstico de correo** y pulsa
+   "Enviar correo de prueba". Si falla, el mensaje indica la causa (falta de configuración,
+   credenciales rechazadas, etc.). Revisa también la carpeta de spam.
 
 > Importante: el recordatorio "a la hora exacta" solo se revisa cada vez que el asesor abre o
 > recarga la app (no hay un proceso corriendo en segundo plano). Para un envío puntual real en
@@ -102,6 +110,22 @@ propia PC), pero **no es apta para producción en Streamlit Cloud** sin este pas
 
 ## Cambios recientes
 
+- **Filtro por fechas en el Dashboard admin**: Hoy, Ayer, Últimos 7 días, Últimos 30 días,
+  Personalizado (rango) y Todo. Aplica a Gestionados, Ventas, Citas, productividad por asesor,
+  resultados por tipificación y al detalle de gestiones (con descarga CSV).
+- **"No contesta" cada 30 leads** en vez de posición aleatoria.
+- **Zona horaria**: Streamlit Cloud corre en UTC; ahora "hoy", "ayer" y las horas de seguimiento se
+  interpretan en hora de Colombia (`America/Bogota`, constante `LOCAL_TZ` en `db.py`). Antes los
+  recordatorios se evaluaban con 5 horas de desfase.
+- **Correo con diagnóstico real**: la app ya no falla en silencio. Hay botón "Enviar correo de
+  prueba" (panel del asesor y pestaña Mantenimiento del admin) que muestra el error exacto, y un
+  botón de admin para enviar ya los recordatorios vencidos.
+- Un seguimiento "Llamar después" vencido pasa a ser el **primer lead de la cola** del asesor.
+
+- **Pestaña "🧹 Mantenimiento"** en el panel de admin: permite eliminar una campaña completa (con
+  sus leads y gestiones) si una importación quedó mal, o vaciar toda la base de leads como último
+  recurso. Ambas acciones piden escribir una palabra de confirmación exacta antes de ejecutarse, y
+  quedan registradas en la auditoría.
 - **"Llamar después" ya no reaparece antes de tiempo**: el lead queda oculto de la cola activa del
   asesor hasta que se cumple la fecha/hora programada; en ese momento vuelve a aparecer
   automáticamente como cualquier otro pendiente.

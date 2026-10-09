@@ -3,3 +3,4 @@ sqlalchemy>=2.0
 pandas>=2.0
 openpyxl>=3.1
 psycopg2-binary>=2.9  # solo se usa si configuras una base de datos Postgres externa (ver README)
+tzdata>=2024.1

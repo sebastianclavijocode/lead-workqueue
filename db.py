@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import hashlib
 import os
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, DateTime, ForeignKey, Text, Boolean
@@ -39,6 +40,29 @@ Base = declarative_base()
 
 ROLES = ("admin", "supervisor", "asesor")
 NO_CONTESTA_LIMIT = 3  # después de este número de intentos, el lead se cierra como gestionado
+NO_CONTESTA_GAP = 30   # un lead "No contesta" reaparece después de gestionar 30 leads más de la cola
+
+# Zona horaria de operación. Streamlit Cloud corre en UTC, así que todo lo que el asesor/admin
+# ve o elige (fechas de seguimiento, "hoy", "ayer") se interpreta en esta zona.
+LOCAL_TZ = ZoneInfo("America/Bogota")
+
+
+def now_local() -> dt.datetime:
+    """Hora actual en la zona local, sin tzinfo (para comparar con next_follow_up, que se guarda local)."""
+    return dt.datetime.now(LOCAL_TZ).replace(tzinfo=None)
+
+
+def to_local(utc_naive: dt.datetime) -> dt.datetime:
+    """Convierte un datetime UTC naive (como created_at) a hora local naive, para mostrarlo."""
+    if utc_naive is None:
+        return None
+    return utc_naive.replace(tzinfo=dt.timezone.utc).astimezone(LOCAL_TZ).replace(tzinfo=None)
+
+
+def local_day_start_utc(day: dt.date) -> dt.datetime:
+    """Inicio del día local `day`, expresado en UTC naive (para filtrar created_at)."""
+    start_local = dt.datetime.combine(day, dt.time.min, tzinfo=LOCAL_TZ)
+    return start_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
 
 def hash_pw(password: str) -> str:
